@@ -1,0 +1,6 @@
+# Environment variables/secrets
+.env
+
+# Dependencies/Node.js files
+node_modules/
+package-lock.json

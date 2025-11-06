@@ -1,0 +1,21 @@
+{
+  "dependencies": {
+    "discord-html-transcripts": "^3.2.0",
+    "discord.js": "^14.24.2",
+    "dotenv": "^17.2.3"
+  },
+  "name": "tickety-bot",
+  "version": "2.0.0",
+  "description": "Stable, multi-panel ticketing bot.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "ticket",
+    "bot"
+  ],
+  "author": "sohail",
+  "license": "ISC"
+}
