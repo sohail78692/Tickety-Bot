@@ -8,33 +8,29 @@ const {
     EmbedBuilder, 
     PermissionsBitField, 
     ChannelType,
-    MessageFlags,
     ModalBuilder, 
     TextInputBuilder, 
     TextInputStyle,
     StringSelectMenuBuilder
 } = require('discord.js');
-const fs = require('fs/promises');
 
-const CONFIG_FILE = 'config.json';
+// --- DATABASE UTILITIES IMPORT (FIX: Imports from db_config.js now) ---
+// Import the Mongoose utility functions from the dedicated database file
+const { 
+    getGuildConfig, 
+    setGuildConfig, 
+    updateGuildConfig 
+} = require('./db_config.js'); // FIXED: Changed from './index.js' to './db_config.js'
 
-// --- Utility Function to Read/Write Config ---
-async function readConfig() {
-    try {
-        const data = await fs.readFile(CONFIG_FILE, 'utf-8');
-        return JSON.parse(data);
-    } catch (error) {
-        console.error("Error reading config.json:", error);
-        return {}; // Return empty object on error
-    }
-}
 
-async function writeConfig(config) {
-    try {
-        await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
-    } catch (error) {
-        console.error("Error writing to config.json:", error);
-    }
+// --- Utility Function to Check Config Status ---
+/**
+ * Checks if the essential configuration (category and support role) is set.
+ * @param {object} config The guild configuration object.
+ * @returns {boolean} True if configured, false otherwise.
+ */
+function isConfigured(config) {
+    return config.categoryId && config.supportRoleId;
 }
 
 // --- Permissions Definitions ---
@@ -45,410 +41,409 @@ const REQUIRED_LOGS_PERMISSIONS = [
 ];
 const REQUIRED_CATEGORY_PERMISSIONS = [
     PermissionsBitField.Flags.ViewChannel,
-    PermissionsBitField.Flags.ManageChannels,
-    PermissionsBitField.Flags.ManageRoles // For setting channel permissions
+    PermissionsBitField.Flags.ManageChannels, // Required to set permissions for new channels
 ];
 
-// --- 1. /ticket-config (ADMIN) ---
+// --- 1. /ticket-config (STAFF) ---
 const ticketConfigCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-config')
-        .setDescription('⚙️ [Admin] Sets the core configuration for the ticket system.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-        .addChannelOption(option =>
+        .setDescription('⚙️ [Staff] Configure the main ticketing system settings.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addChannelOption(option => 
             option.setName('category')
-                .setDescription('The category where new tickets will be created.')
+                .setDescription('The category where new ticket channels will be created.')
                 .addChannelTypes(ChannelType.GuildCategory)
-                .setRequired(true))
-        .addRoleOption(option =>
-            option.setName('support_role')
-                .setDescription('The role that will have access to all tickets.')
-                .setRequired(true))
+                .setRequired(false))
         .addChannelOption(option =>
-            option.setName('logs_channel')
-                .setDescription('The text channel where ticket transcripts and logs will be sent.')
+            option.setName('logs-channel')
+                .setDescription('The text channel where transcripts and logs will be sent.')
                 .addChannelTypes(ChannelType.GuildText)
-                .setRequired(true)),
-
+                .setRequired(false))
+        .addRoleOption(option =>
+            option.setName('support-role')
+                .setDescription('The role that will be pinged and given access to tickets.')
+                .setRequired(false))
+        .addStringOption(option => 
+            option.setName('action')
+                .setDescription('Select an action (e.g., view current settings).')
+                .setRequired(false)
+                .addChoices(
+                    { name: 'view', value: 'view' },
+                    { name: 'reset', value: 'reset' }
+                )),
+    
     async execute(interaction) {
-        const categoryChannel = interaction.options.getChannel('category');
-        const supportRole = interaction.options.getRole('support_role');
-        const logsChannel = interaction.options.getChannel('logs_channel');
-        const botMember = interaction.guild.members.me;
+        await interaction.deferReply({ ephemeral: true });
+        const guild = interaction.guild;
+        const action = interaction.options.getString('action');
+        const category = interaction.options.getChannel('category');
+        const logsChannel = interaction.options.getChannel('logs-channel');
+        const supportRole = interaction.options.getRole('support-role');
 
-        // --- 1. Permission Check: Logs Channel ---
-        const logPerms = logsChannel.permissionsFor(botMember);
-        const missingLogPerms = REQUIRED_LOGS_PERMISSIONS.filter(perm => !logPerms.has(perm));
+        let config = await getGuildConfig(guild.id);
+        const update = {};
 
-        if (missingLogPerms.length > 0) {
-            return interaction.reply({
-                content: `❌ **Permissions Error!**\nI'm missing the following permissions in the **Logs Channel** (${logsChannel}):\n\`${missingLogPerms.join('`, `')}\`\nPlease grant these permissions and try again.`,
-                flags: MessageFlags.Ephemeral
+        if (action === 'view') {
+            return interaction.editReply({ embeds: [createConfigViewEmbed(config, guild)] });
+        }
+
+        if (action === 'reset') {
+            await setGuildConfig(guild.id, { guildId: guild.id, ticketTopics: [] });
+            return interaction.editReply({ 
+                content: '✅ All ticketing configuration (category, logs, role, topics) has been reset to default values.',
+                embeds: [createConfigViewEmbed({ guildId: guild.id, ticketTopics: [] }, guild)] 
             });
         }
         
-        // --- 2. Permission Check: Ticket Category ---
-        const categoryPerms = categoryChannel.permissionsFor(botMember);
-        const missingCategoryPerms = REQUIRED_CATEGORY_PERMISSIONS.filter(perm => !categoryPerms.has(perm));
-        
-        if (missingCategoryPerms.length > 0) {
-            return interaction.reply({
-                content: `❌ **Permissions Error!**\nI'm missing the following permissions in the **Ticket Category** (${categoryChannel}):\n\`${missingCategoryPerms.join('`, `')}\`\nPlease grant these permissions and try again.`,
-                flags: MessageFlags.Ephemeral
-            });
-        }
-
-        // --- 3. Save Configuration ---
-        try {
-            const config = await readConfig();
-            
-            // Initialize guild config if it doesn't exist
-            if (!config[interaction.guildId]) {
-                config[interaction.guildId] = { ticketTopics: [] };
+        // --- Apply Updates ---
+        if (category) {
+            if (!guild.members.me.permissionsIn(category).has(REQUIRED_CATEGORY_PERMISSIONS)) {
+                return interaction.editReply(`❌ Bot requires the following permissions in the **${category.name}** category: \`${REQUIRED_CATEGORY_PERMISSIONS.join(', ')}\`.`);
             }
-            
-            config[interaction.guildId].categoryId = categoryChannel.id;
-            config[interaction.guildId].logsChannelId = logsChannel.id;
-            config[interaction.guildId].supportRoleId = supportRole.id;
-            
-            await writeConfig(config);
-
-            const responseEmbed = new EmbedBuilder()
-                .setTitle('✅ System Configured Successfully')
-                .setDescription('The **Tickety Bot** is now ready! Here\'s your setup:')
-                .addFields(
-                    { name: '📁 Ticket Category', value: `${categoryChannel}`, inline: true },
-                    { name: '🛡️ Support Role', value: `${supportRole}`, inline: true },
-                    { name: '📜 Logs Channel', value: `${logsChannel}`, inline: true }
-                )
-                .setColor(0x57F287) // Green
-                .setFooter({ text: 'Next steps: Use /ticket-topic to add topics, then /ticket-panel to post.' });
-
-            await interaction.reply({ embeds: [responseEmbed], flags: MessageFlags.Ephemeral });
-
-        } catch (error) {
-            console.error('Error saving configuration:', error);
-            await interaction.reply({ content: '❌ An unexpected error occurred while saving the configuration.', flags: MessageFlags.Ephemeral });
+            update.categoryId = category.id;
         }
-    },
+
+        if (logsChannel) {
+            if (!guild.members.me.permissionsIn(logsChannel).has(REQUIRED_LOGS_PERMISSIONS)) {
+                 return interaction.editReply(`❌ Bot requires the following permissions in the **${logsChannel.name}** channel: \`${REQUIRED_LOGS_PERMISSIONS.join(', ')}\`.`);
+            }
+            update.logsChannelId = logsChannel.id;
+        }
+
+        if (supportRole) {
+            update.supportRoleId = supportRole.id;
+        }
+
+        if (Object.keys(update).length > 0) {
+            await updateGuildConfig(guild.id, update);
+            // Re-fetch the config to show the updated state
+            config = await getGuildConfig(guild.id); 
+            await interaction.editReply({ 
+                content: '✅ Ticketing configuration updated.', 
+                embeds: [createConfigViewEmbed(config, guild)] 
+            });
+        } else {
+             // If no options were provided, just show the view embed
+            await interaction.editReply({ embeds: [createConfigViewEmbed(config, guild)] });
+        }
+    }
 };
 
-// --- 2. /ticket-topic (ADMIN) ---
+/**
+ * Creates an embed showing the current guild configuration.
+ * @param {object} config The guild configuration object.
+ * @param {Guild} guild The Discord Guild object.
+ * @returns {EmbedBuilder} The configuration view embed.
+ */
+function createConfigViewEmbed(config, guild) {
+    const isReady = isConfigured(config) && config.ticketTopics.length > 0;
+    const topicsList = config.ticketTopics.map((t, i) => 
+        `\`${i + 1}.\` ${t.emoji || '📄'} **${t.label}** (\`${t.value}\`)`
+    ).join('\n') || '*No topics configured. Use `/ticket-topic add`.*';
+
+    const embed = new EmbedBuilder()
+        .setColor(isReady ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setTitle('🎫 Ticketing System Configuration')
+        .setDescription(isReady 
+            ? '✅ The system is configured and ready to use!' 
+            : '⚠️ Essential setup incomplete. Please set a Category, Support Role, and add at least one Topic.'
+        )
+        .addFields(
+            { 
+                name: 'Ticket Category', 
+                value: config.categoryId ? `<#${config.categoryId}> (\`${config.categoryId}\`)` : '`Not Set`', 
+                inline: true 
+            },
+            { 
+                name: 'Support Role', 
+                value: config.supportRoleId ? `<@&${config.supportRoleId}> (\`${config.supportRoleId}\`)` : '`Not Set`', 
+                inline: true 
+            },
+            { 
+                name: 'Logs Channel', 
+                value: config.logsChannelId ? `<#${config.logsChannelId}> (\`${config.logsChannelId}\`)` : '`Not Set`', 
+                inline: true 
+            },
+            { 
+                name: `Configured Topics (${config.ticketTopics.length})`, 
+                value: topicsList, 
+            }
+        )
+        .setFooter({ text: `Guild ID: ${guild.id}` })
+        .setTimestamp();
+    
+    return embed;
+}
+
+// --- 2. /ticket-topic (STAFF) ---
 const ticketTopicCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-topic')
-        .setDescription('⚙️ [Admin] Manages the topics for the ticket panel dropdown.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-        .addSubcommand(sub => sub
-            .setName('add')
-            .setDescription('Add a new topic to the ticket panel.')
-            .addStringOption(opt => opt.setName('label').setDescription('The text shown in the dropdown (e.g., "General Support").').setRequired(true).setMaxLength(100))
-            .addStringOption(opt => opt.setName('value').setDescription('A unique ID (e.g., "general_support"). No spaces.').setRequired(true).setMaxLength(100))
-            .addStringOption(opt => opt.setName('description').setDescription('A short description shown under the label.').setRequired(false).setMaxLength(100))
-            .addStringOption(opt => opt.setName('emoji').setDescription('An optional emoji for the topic.').setRequired(false))
-        )
-        .addSubcommand(sub => sub
-            .setName('remove')
-            .setDescription('Remove a topic from the ticket panel.')
-            .addStringOption(opt => opt.setName('value').setDescription('The unique ID (value) of the topic to remove.').setRequired(true).setMaxLength(100))
-        )
-        .addSubcommand(sub => sub
-            .setName('list')
-            .setDescription('List all current ticket topics.')
-        ),
-
+        .setDescription('📋 [Staff] Manage ticket topics for the panel.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addSubcommand(subcommand =>
+            subcommand.setName('add')
+                .setDescription('Adds a new topic to the ticket panel.')
+                .addStringOption(option => option.setName('label').setDescription('Display name for the topic (e.g., General Support)').setRequired(true))
+                .addStringOption(option => option.setName('value').setDescription('Unique ID/Value for the topic (e.g., general_support)').setRequired(true))
+                .addStringOption(option => option.setName('description').setDescription('Short description for the topic.').setRequired(true))
+                .addStringOption(option => option.setName('emoji').setDescription('Optional: Emoji for the topic (character or custom ID).')))
+        .addSubcommand(subcommand =>
+            subcommand.setName('remove')
+                .setDescription('Removes a topic using its unique value.')
+                .addStringOption(option => option.setName('value').setDescription('The unique ID/Value of the topic to remove.').setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand.setName('list')
+                .setDescription('Lists all currently configured topics.')),
+    
     async execute(interaction) {
-        const config = await readConfig();
-        const guildConfig = config[interaction.guildId];
-
-        if (!guildConfig || !guildConfig.categoryId) {
-            return interaction.reply({ content: '❌ Please run `/ticket-config` first before managing topics.', flags: MessageFlags.Ephemeral });
-        }
-        
-        // Ensure ticketTopics array exists
-        if (!guildConfig.ticketTopics) {
-            guildConfig.ticketTopics = [];
-        }
-
+        await interaction.deferReply({ ephemeral: true });
+        const guildId = interaction.guild.id;
+        let config = await getGuildConfig(guildId);
         const subcommand = interaction.options.getSubcommand();
 
-        try {
-            if (subcommand === 'add') {
-                const label = interaction.options.getString('label');
-                const value = interaction.options.getString('value').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, ''); // Clean value
-                const description = interaction.options.getString('description') || 'Click to open a ticket.';
-                const emoji = interaction.options.getString('emoji') || null;
-
-                if (!value) {
-                     return interaction.reply({ content: `❌ The ID \`${interaction.options.getString('value')}\` is invalid. Please use letters, numbers, and underscores only.`, flags: MessageFlags.Ephemeral });
-                }
-
-                if (guildConfig.ticketTopics.find(t => t.value === value)) {
-                    return interaction.reply({ content: `❌ A topic with the ID \`${value}\` already exists. Please choose a unique value.`, flags: MessageFlags.Ephemeral });
-                }
-                
-                if (guildConfig.ticketTopics.length >= 25) {
-                    return interaction.reply({ content: '❌ You have reached the maximum limit of 25 ticket topics.', flags: MessageFlags.Ephemeral });
-                }
-
-                guildConfig.ticketTopics.push({ label, value, description, emoji });
-                await writeConfig(config);
-
-                await interaction.reply({ content: `✅ Successfully added topic: **${label}**`, flags: MessageFlags.Ephemeral });
-
-            } else if (subcommand === 'remove') {
-                const value = interaction.options.getString('value');
-                const originalLength = guildConfig.ticketTopics.length;
-                guildConfig.ticketTopics = guildConfig.ticketTopics.filter(t => t.value !== value);
-
-                if (guildConfig.ticketTopics.length === originalLength) {
-                    return interaction.reply({ content: `❌ No topic with the ID \`${value}\` was found.`, flags: MessageFlags.Ephemeral });
-                }
-
-                await writeConfig(config);
-                await interaction.reply({ content: `✅ Successfully removed topic with ID: \`${value}\``, flags: MessageFlags.Ephemeral });
-
-            } else if (subcommand === 'list') {
-                if (guildConfig.ticketTopics.length === 0) {
-                    return interaction.reply({ content: 'ℹ️ You have no ticket topics configured. Use `/ticket-topic add` to create one.', flags: MessageFlags.Ephemeral });
-                }
-
-                const embed = new EmbedBuilder()
-                    .setTitle('🎫 Current Ticket Topics')
-                    .setColor(0x5865F2)
-                    .setDescription(guildConfig.ticketTopics.map((t, i) => {
-                        return `**${i + 1}. ${t.label}** ${t.emoji || ''}\n   - **ID:** \`${t.value}\`\n   - **Desc:** *${t.description}*`;
-                    }).join('\n\n'));
-                
-                await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-            }
-        } catch (error) {
-            console.error('Error in /ticket-topic:', error);
-            await interaction.reply({ content: '❌ An error occurred while managing topics.', flags: MessageFlags.Ephemeral });
+        if (subcommand === 'list') {
+            return interaction.editReply({ embeds: [createConfigViewEmbed(config, interaction.guild)] });
         }
-    },
+
+        if (subcommand === 'add') {
+            const label = interaction.options.getString('label');
+            const value = interaction.options.getString('value').toLowerCase().replace(/[^a-z0-9_]+/g, ''); // Sanitize value
+            const description = interaction.options.getString('description');
+            const emoji = interaction.options.getString('emoji');
+
+            if (config.ticketTopics.some(t => t.value === value)) {
+                return interaction.editReply(`❌ A topic with the unique value \`${value}\` already exists.`);
+            }
+
+            const newTopic = { label, value, description, emoji };
+            config.ticketTopics.push(newTopic);
+
+            await setGuildConfig(guildId, config);
+            return interaction.editReply(`✅ Topic **${label}** (\`${value}\`) has been added to the configuration.`);
+        }
+
+        if (subcommand === 'remove') {
+            const valueToRemove = interaction.options.getString('value');
+            const initialLength = config.ticketTopics.length;
+            
+            config.ticketTopics = config.ticketTopics.filter(t => t.value !== valueToRemove);
+            
+            if (config.ticketTopics.length === initialLength) {
+                return interaction.editReply(`❌ Topic with value \`${valueToRemove}\` not found.`);
+            }
+
+            await setGuildConfig(guildId, config);
+            return interaction.editReply(`✅ Topic with value \`${valueToRemove}\` has been removed.`);
+        }
+    }
 };
 
-// --- 3. /ticket-panel (ADMIN) ---
+// --- 3. /ticket-panel (STAFF) ---
 const ticketPanelCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-panel')
-        .setDescription('⚙️ [Admin] Posts the main ticket creation panel with a dropdown menu.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-        .addStringOption(option =>
+        .setDescription('🖼️ [Staff] Send the ticket creation panel to the current channel.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addStringOption(option => 
+            option.setName('style')
+                .setDescription('Select the style for the panel.')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Buttons (up to 5 topics)', value: 'buttons' },
+                    { name: 'Select Menu (for 5+ topics)', value: 'select' }
+                ))
+        .addStringOption(option => 
             option.setName('title')
-                .setDescription('The main title for the panel embed (e.g., "Support Center").')
-                .setRequired(true))
-        .addStringOption(option =>
+                .setDescription('Optional: Title for the embed.')
+                .setRequired(false))
+        .addStringOption(option => 
             option.setName('description')
-                .setDescription('The text to display above the dropdown menu.')
-                .setRequired(true)),
-
+                .setDescription('Optional: Description for the embed.')
+                .setRequired(false)),
+    
     async execute(interaction) {
-        const config = await readConfig();
-        const guildConfig = config[interaction.guildId];
-        const title = interaction.options.getString('title');
-        const description = interaction.options.getString('description');
+        await interaction.deferReply({ ephemeral: true });
+        const config = await getGuildConfig(interaction.guild.id);
+        const style = interaction.options.getString('style');
+        const title = interaction.options.getString('title') || 'Need Assistance? Open a Ticket!';
+        const description = interaction.options.getString('description') || 'Select a topic below to open a private support ticket. Please be detailed in your request.';
 
-        if (!guildConfig || !guildConfig.categoryId) {
-            return interaction.reply({ content: '❌ Please run `/ticket-config` first.', flags: MessageFlags.Ephemeral });
+        if (!isConfigured(config)) {
+            return interaction.editReply('❌ The ticketing system is not fully configured. Please set the Category and Support Role using `/ticket-config` first.');
         }
 
-        if (!guildConfig.ticketTopics || guildConfig.ticketTopics.length === 0) {
-            return interaction.reply({ content: '❌ You must add at least one topic with `/ticket-topic add` before posting a panel.', flags: MessageFlags.Ephemeral });
+        if (config.ticketTopics.length === 0) {
+            return interaction.editReply('❌ No ticket topics have been configured. Please add topics using `/ticket-topic add` first.');
         }
 
-        // --- 1. Build Embed ---
         const panelEmbed = new EmbedBuilder()
+            .setColor(0x3498DB)
             .setTitle(title)
             .setDescription(description)
-            .setColor(0x5865F2) // Discord Blurple
-            .setFooter({ text: 'Please select a topic to open a ticket.' });
+            .setTimestamp();
+        
+        let components = [];
 
-        // --- 2. Build Select Menu ---
-        const selectMenu = new StringSelectMenuBuilder()
-            .setCustomId('ticket_panel_menu')
-            .setPlaceholder('Click to select a support topic...')
-            .setMinValues(1)
-            .setMaxValues(1)
-            .addOptions(guildConfig.ticketTopics.map(topic => ({
+        if (style === 'buttons') {
+            if (config.ticketTopics.length > 5) {
+                return interaction.editReply('❌ You selected the **Button** style, but you have more than 5 topics. Please use the **Select Menu** style or remove some topics.');
+            }
+            // Create a button for each topic
+            const row = new ActionRowBuilder();
+            config.ticketTopics.forEach(topic => {
+                row.addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`ticket_open_${topic.value}`)
+                        .setLabel(topic.label)
+                        .setStyle(ButtonStyle.Primary)
+                        .setEmoji(topic.emoji || '🎫')
+                );
+            });
+            components.push(row);
+
+        } else if (style === 'select') {
+            // Create a select menu with all topics
+            const options = config.ticketTopics.map(topic => ({
                 label: topic.label,
                 description: topic.description,
                 value: topic.value,
-                emoji: topic.emoji || undefined
-            })));
-        
-        const row = new ActionRowBuilder().addComponents(selectMenu);
+                emoji: topic.emoji,
+            }));
 
-        // --- 3. Send Panel with Error Handling (FIX for 50013) ---
-        try {
-            await interaction.channel.send({
-                embeds: [panelEmbed],
-                components: [row]
-            });
-            await interaction.reply({ content: '✅ Ticket panel posted successfully!', flags: MessageFlags.Ephemeral });
-        
-        } catch (error) {
-            console.error('Error sending ticket panel:', error);
-            // Check for the specific Missing Permissions error (50013)
-            if (error.code === 50013) {
-                return interaction.reply({
-                    content: `❌ **Permissions Error!**\nI failed to post the panel in ${interaction.channel}.\nPlease ensure I have \`View Channel\` and \`Send Messages\` permissions there.`,
-                    flags: MessageFlags.Ephemeral
-                });
-            }
-            // Generic fallback
-            await interaction.reply({ content: '❌ An unexpected error occurred while posting the panel.', flags: MessageFlags.Ephemeral });
+            const selectMenu = new StringSelectMenuBuilder()
+                .setCustomId('ticket_panel_topic_select')
+                .setPlaceholder('Select a ticket topic...')
+                .addOptions(options);
+
+            components.push(new ActionRowBuilder().addComponents(selectMenu));
         }
-    },
+
+        // Send the panel
+        await interaction.channel.send({
+            embeds: [panelEmbed],
+            components: components
+        });
+
+        // Confirm to the staff member
+        await interaction.editReply({ content: '✅ Ticket panel sent successfully to this channel.' });
+    }
 };
 
 // --- 4. /ticket-rename (STAFF) ---
 const ticketRenameCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-rename')
-        .setDescription('✍️ [Staff] Renames the current ticket channel.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels) // Base perm check
-        .addStringOption(option =>
-            option.setName('new_name')
-                .setDescription('The new name for the ticket channel (e.g., bug-report-user).')
-                .setRequired(true)
-                .setMinLength(3)
-                .setMaxLength(100)),
-                
+        .setDescription('✏️ [Staff] Renames the current ticket channel.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addStringOption(option => 
+            option.setName('new-name')
+                .setDescription('The new name for the ticket channel (e.g., urgent-issue-user).')
+                .setRequired(true)),
     async execute(interaction) {
-        // Validation (isSupportUser, isTicketChannel) is handled in index.js
-        const newName = interaction.options.getString('new_name');
-        
-        try {
-            const oldName = interaction.channel.name;
-            await interaction.channel.setName(newName);
-
-            const renameEmbed = new EmbedBuilder()
-                .setColor(0x5865F2)
-                .setDescription(`✍️ Channel renamed from \`#${oldName}\` to \`#${newName}\` by ${interaction.user}.`);
-            
-            await interaction.channel.send({ embeds: [renameEmbed] });
-            await interaction.reply({ content: '✅ Channel renamed.', flags: MessageFlags.Ephemeral });
-
-        } catch (error) {
-            console.error('Error renaming channel:', error);
-            await interaction.reply({ 
-                content: '❌ **Rename Failed.** Ensure the name is valid (no spaces, special chars) and I have `Manage Channels` permission.', 
-                flags: MessageFlags.Ephemeral 
-            });
-        }
-    },
+        // Import handler function from index.js at runtime
+        const { handleRenameTicket } = require('./index.js'); 
+        const newName = interaction.options.getString('new-name');
+        await handleRenameTicket(interaction, newName);
+    }
 };
 
 // --- 5. /ticket-add (STAFF) ---
 const ticketAddCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-add')
-        .setDescription('👤 [Staff] Adds a user to the current ticket channel.')
+        .setDescription('➕ [Staff] Adds a user to the current ticket channel.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
-        .addUserOption(option =>
+        .addUserOption(option => 
             option.setName('user')
                 .setDescription('The user to add to the ticket.')
                 .setRequired(true)),
-
     async execute(interaction) {
-        const userToAdd = interaction.options.getUser('user');
-        
-        try {
-            await interaction.channel.permissionOverwrites.edit(userToAdd.id, {
-                ViewChannel: true,
-                SendMessages: true
-            });
-
-            const addEmbed = new EmbedBuilder()
-                .setColor(0x57F287) // Green
-                .setDescription(`👤 ${userToAdd} has been **added** to this ticket by ${interaction.user}.`);
-
-            await interaction.channel.send({ embeds: [addEmbed] });
-            await interaction.reply({ content: `✅ Added ${userToAdd.tag} to the ticket.`, flags: MessageFlags.Ephemeral });
-
-        } catch (error) {
-            console.error('Error adding user:', error);
-            await interaction.reply({ 
-                content: '❌ **Add Failed.** Ensure I have `Manage Roles` permission in this category.', 
-                flags: MessageFlags.Ephemeral 
-            });
-        }
-    },
+        // Import handler function from index.js at runtime
+        const { handleUserManagement } = require('./index.js');
+        const user = interaction.options.getUser('user');
+        await handleUserManagement(interaction, user, true); // true for add
+    }
 };
 
 // --- 6. /ticket-remove (STAFF) ---
 const ticketRemoveCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-remove')
-        .setDescription('✖️ [Staff] Removes a user from the current ticket channel.')
+        .setDescription('➖ [Staff] Removes a user from the current ticket channel.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
-        .addUserOption(option =>
+        .addUserOption(option => 
             option.setName('user')
                 .setDescription('The user to remove from the ticket.')
                 .setRequired(true)),
-
     async execute(interaction) {
-        const userToRemove = interaction.options.getUser('user');
-
-        try {
-            await interaction.channel.permissionOverwrites.delete(userToRemove.id);
-
-            const removeEmbed = new EmbedBuilder()
-                .setColor(0xED4245) // Red
-                .setDescription(`✖️ ${userToRemove} has been **removed** from this ticket by ${interaction.user}.`);
-            
-            await interaction.channel.send({ embeds: [removeEmbed] });
-            await interaction.reply({ content: `✅ Removed ${userToRemove.tag} from the ticket.`, flags: MessageFlags.Ephemeral });
-
-        } catch (error) {
-            console.error('Error removing user:', error);
-            await interaction.reply({ 
-                content: '❌ **Remove Failed.** Ensure I have `Manage Roles` permission in this category.', 
-                flags: MessageFlags.Ephemeral 
-            });
-        }
-    },
-};
-
-// --- 7. /ticket-claim (STAFF) ---
-const ticketClaimCommand = {
-    data: new SlashCommandBuilder()
-        .setName('ticket-claim')
-        .setDescription('🙋 [Staff] Claims the current ticket, assigning it to yourself.')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
-    async execute(interaction) {
-        // This command just triggers the button logic, which is handled in index.js
-        // The validation (isSupport, isTicket) is already done by the command handler in index.js
-        
-        // We call the handler function directly from index.js
-        const { handleClaimTicket } = require('./index.js'); // Import from index
-        await handleClaimTicket(interaction, true); // `true` to force claim
+        // Import handler function from index.js at runtime
+        const { handleUserManagement } = require('./index.js');
+        const user = interaction.options.getUser('user');
+        await handleUserManagement(interaction, user, false); // false for remove
     }
 };
 
-// --- 8. /ticket-lock (STAFF) ---
+// --- 7. /ticket-close (STAFF) ---
+const ticketCloseCommand = {
+    data: new SlashCommandBuilder()
+        .setName('ticket-close')
+        .setDescription('🔒 [Staff] Closes and archives the current ticket channel.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addBooleanOption(option => 
+            option.setName('silent')
+                .setDescription('Whether to close the ticket without a final message in the channel.')
+                .setRequired(false)),
+    async execute(interaction) {
+        // Import handler function from index.js at runtime
+        const { handleCloseTicket } = require('./index.js');
+        const silent = interaction.options.getBoolean('silent') || false;
+        await handleCloseTicket(interaction, silent);
+    }
+};
+
+// --- 8. /ticket-claim (STAFF) ---
+const ticketClaimCommand = {
+    data: new SlashCommandBuilder()
+        .setName('ticket-claim')
+        .setDescription('🙋‍♂️ [Staff] Claims the ticket, assigning it to yourself.')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels)
+        .addBooleanOption(option => 
+            option.setName('force')
+                .setDescription('Forcefully claim the ticket even if already claimed by someone else.')
+                .setRequired(false)),
+    async execute(interaction) {
+        // Import handler function from index.js at runtime
+        const { handleClaimTicket } = require('./index.js'); 
+        const forceClaim = interaction.options.getBoolean('force') || false;
+        await handleClaimTicket(interaction, forceClaim);
+    }
+};
+
+// --- 9. /ticket-lock (STAFF) ---
 const ticketLockCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-lock')
         .setDescription('🔒 [Staff] Locks the ticket, preventing the user from sending messages.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
     async execute(interaction) {
+        // Import handler function from index.js at runtime
         const { handleLockTicket } = require('./index.js');
-        await handleLockTicket(interaction, true); // `true` to lock
+        await handleLockTicket(interaction, true); 
     }
 };
 
-// --- 9. /ticket-unlock (STAFF) ---
+// --- 10. /ticket-unlock (STAFF) ---
 const ticketUnlockCommand = {
     data: new SlashCommandBuilder()
         .setName('ticket-unlock')
         .setDescription('🔓 [Staff] Unlocks the ticket, allowing the user to send messages again.')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
     async execute(interaction) {
+        // Import handler function from index.js at runtime
         const { handleLockTicket } = require('./index.js');
-        await handleLockTicket(interaction, false); // `false` to unlock
+        await handleLockTicket(interaction, false); 
     }
 };
 
@@ -461,7 +456,8 @@ module.exports = [
     ticketRenameCommand,
     ticketAddCommand,
     ticketRemoveCommand,
+    ticketCloseCommand,
     ticketClaimCommand,
     ticketLockCommand,
-    ticketUnlockCommand
+    ticketUnlockCommand,
 ];

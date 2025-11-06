@@ -2,7 +2,9 @@
   "dependencies": {
     "discord-html-transcripts": "^3.2.0",
     "discord.js": "^14.24.2",
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "mongoose": "^8.19.3",
+    "express": "^4.19.2"
   },
   "name": "tickety-bot",
   "version": "2.0.0",
