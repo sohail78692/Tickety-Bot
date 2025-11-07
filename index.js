@@ -18,7 +18,8 @@ const {
     DiscordAPIError,
     ModalBuilder, 
     TextInputBuilder, 
-    TextInputStyle
+    TextInputStyle,
+    ActivityType
 } = require('discord.js');
 const { createTranscript } = require('discord-html-transcripts');
 
@@ -570,6 +571,8 @@ async function handleUserManagement(interaction, userToManage, isAdd) {
 
 client.on('ready', async () => {
     console.log(`🤖 ${client.user.tag} is online and ready!`);
+
+    client.user.setActivity(' Your Tickets 24/7', { type: ActivityType.Watching });
     
     // Register commands globally
     const clientId = process.env.CLIENT_ID;
